@@ -26,7 +26,6 @@ class JournalEntry(AccountsController):
 		self.clearance_date = None
 
 		self.validate_party()
-		self.validate_cheque_info()
 		self.validate_entries_for_advance()
 		self.validate_multi_currency()
 		self.set_amounts_in_company_currency()
@@ -45,6 +44,7 @@ class JournalEntry(AccountsController):
 			self.title = self.get_title()
 
 	def on_submit(self):
+		self.validate_cheque_info()
 		self.check_credit_limit()
 		self.make_gl_entries()
 		self.update_advance_paid()
@@ -126,7 +126,7 @@ class JournalEntry(AccountsController):
 				"inter_company_journal_entry_reference", "")
 
 	def unlink_asset_adjustment_entry(self):
-		frappe.db.sql(""" update `tabAsset Adjustment`
+		frappe.db.sql(""" update `tabAsset Value Adjustment`
 			set journal_entry = null where journal_entry = %s""", self.name)
 
 	def validate_party(self):

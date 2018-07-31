@@ -58,7 +58,7 @@ class StockReconciliation(StockController):
 				item.current_valuation_rate = rate
 				self.difference_amount += (flt(item.qty, item.precision("qty")) * \
 					flt(item.valuation_rate or rate, item.precision("valuation_rate")) \
-					- flt(qty) * flt(rate))
+					- flt(qty, item.precision("qty")) * flt(rate, item.precision("valuation_rate")))
 				return True
 
 		items = filter(lambda d: _changed(d), self.items)
@@ -246,7 +246,9 @@ class StockReconciliation(StockController):
 	def set_total_qty_and_amount(self):
 		for d in self.get("items"):
 			d.amount = flt(d.qty, d.precision("qty")) * flt(d.valuation_rate, d.precision("valuation_rate"))
-			d.current_amount = flt(d.current_qty) * flt(d.current_valuation_rate)
+			d.current_amount = (flt(d.current_qty,
+				d.precision("current_qty")) * flt(d.current_valuation_rate, d.precision("current_valuation_rate")))
+
 			d.quantity_difference = flt(d.qty) - flt(d.current_qty)
 			d.amount_difference = flt(d.amount) - flt(d.current_amount)
 
@@ -269,7 +271,7 @@ class StockReconciliation(StockController):
 
 @frappe.whitelist()
 def get_items(warehouse, posting_date, posting_time, company):
-	items = frappe.get_list("Bin", fields=["item_code"], filters={"warehouse": warehouse}, as_list=1)
+	items = [d.item_code for d in frappe.get_list("Bin", fields=["item_code"], filters={"warehouse": warehouse})]
 
 	items += frappe.db.sql_list('''select i.name from `tabItem` i, `tabItem Default` id where i.name = id.parent
 		and i.is_stock_item=1 and i.has_serial_no=0 and i.has_batch_no=0 and i.has_variants=0 and i.disabled=0

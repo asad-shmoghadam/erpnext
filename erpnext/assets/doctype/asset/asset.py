@@ -3,41 +3,45 @@
 # For license information, please see license.txt
 
 from __future__ import unicode_literals
-import frappe
+import frappe, erpnext
 from frappe import _
 from frappe.utils import flt, add_months, cint, nowdate, getdate, today, date_diff
 from frappe.model.document import Document
 from erpnext.assets.doctype.asset_category.asset_category import get_asset_category_account
 from erpnext.assets.doctype.asset.depreciation \
 	import get_disposal_account_and_cost_center, get_depreciation_accounts
-from erpnext.accounts.general_ledger import make_gl_entries
+from erpnext.accounts.general_ledger import make_gl_entries, delete_gl_entries
 from erpnext.accounts.utils import get_account_currency
 from erpnext.controllers.accounts_controller import AccountsController
 
 class Asset(AccountsController):
 	def validate(self):
-		self.status = self.get_status()
+		self.validate_asset_values()
 		self.validate_item()
 		self.set_missing_values()
-		self.validate_asset_values()
 		if self.calculate_depreciation:
 			self.make_depreciation_schedule()
 			self.set_accumulated_depreciation()
-			get_depreciation_accounts(self)
 		else:
 			self.finance_books = []
 		if self.get("schedules"):
 			self.validate_expected_value_after_useful_life()
 
+		self.status = self.get_status()
+
 	def on_submit(self):
 		self.validate_in_use_date()
 		self.set_status()
 		self.update_stock_movement()
+		if not self.booked_fixed_asset:
+			self.make_gl_entries()
 
 	def on_cancel(self):
 		self.validate_cancellation()
 		self.delete_depreciation_entries()
 		self.set_status()
+		delete_gl_entries(voucher_type='Asset', voucher_no=self.name)
+		self.db_set('booked_fixed_asset', 0)
 
 	def validate_item(self):
 		item = frappe.db.get_value("Item", self.item_code,
@@ -67,8 +71,19 @@ class Asset(AccountsController):
 		if not flt(self.gross_purchase_amount):
 			frappe.throw(_("Gross Purchase Amount is mandatory"), frappe.MandatoryError)
 
+		if not self.is_existing_asset and not (self.purchase_receipt or self.purchase_invoice):
+			frappe.throw(_("Please create purchase receipt or purchase invoice for the item {0}").
+				format(self.item_code))
+
+		if (not self.purchase_receipt and self.purchase_invoice
+			and not frappe.db.get_value('Purchase Invoice', self.purchase_invoice, 'update_stock')):
+			frappe.throw(_("Update stock must be enable for the purchase invoice {0}").
+				format(self.purchase_invoice))
+
 		if not self.calculate_depreciation:
 			return
+		elif not self.finance_books:
+			frappe.throw(_("Enter depreciation details"))
 
 		if self.available_for_use_date and getdate(self.available_for_use_date) < getdate(nowdate()):
 			frappe.throw(_("Available-for-use Date is entered as past date"))
@@ -100,7 +115,7 @@ class Asset(AccountsController):
 
 				from_date = self.available_for_use_date
 				if number_of_pending_depreciations:
-					next_depr_date = getdate(add_months(self.available_for_use_date, 
+					next_depr_date = getdate(add_months(self.available_for_use_date,
 						number_of_pending_depreciations * 12))
 					if  (cint(frappe.db.get_value("Asset Settings", None, "schedule_based_on_fiscal_year")) == 1
 						and getdate(d.depreciation_start_date) < next_depr_date):
@@ -299,22 +314,31 @@ class Asset(AccountsController):
 			status = "Draft"
 		elif self.docstatus == 1:
 			status = "Submitted"
-			expected_value_after_useful_life = flt(sum([d.expected_value_after_useful_life
-				for d in self.get('finance_books')]))
-
-			value_after_depreciation = flt(sum([d.value_after_depreciation
-				for d in self.get('finance_books')]))
 
 			if self.journal_entry_for_scrap:
 				status = "Scrapped"
 			elif self.finance_books:
+				idx = self.get_default_finance_book_idx() or 0
+
+				expected_value_after_useful_life = self.finance_books[idx].expected_value_after_useful_life
+				value_after_depreciation = self.finance_books[idx].value_after_depreciation
+
 				if flt(value_after_depreciation) <= expected_value_after_useful_life:
 					status = "Fully Depreciated"
-				elif flt(self.value_after_depreciation) < flt(self.gross_purchase_amount):
+				elif flt(value_after_depreciation) < flt(self.gross_purchase_amount):
 					status = 'Partially Depreciated'
 		elif self.docstatus == 2:
 			status = "Cancelled"
 		return status
+
+	def get_default_finance_book_idx(self):
+		if not self.get('default_finance_book') and self.company:
+			self.default_finance_book = erpnext.get_default_finance_book(self.company)
+
+		if self.get('default_finance_book'):
+			for d in self.get('finance_books'):
+				if d.finance_book == self.default_finance_book:
+					return cint(d.idx) - 1
 
 	def update_stock_movement(self):
 		asset_movement = frappe.db.get_value('Asset Movement',
@@ -325,14 +349,16 @@ class Asset(AccountsController):
 			doc.submit()
 
 	def make_gl_entries(self):
-		if self.purchase_receipt and self.purchase_receipt_amount:
-			from erpnext.accounts.general_ledger import make_gl_entries
+		gl_entries = []
 
-			gl_entries = []
-
-			cwip_account = get_cwip_account(self.name, self.asset_category, self.company)
+		if ((self.purchase_receipt or (self.purchase_invoice and
+			frappe.db.get_value('Purchase Invoice', self.purchase_invoice, 'update_stock')))
+			and self.purchase_receipt_amount and self.available_for_use_date <= nowdate()):
 			fixed_aseet_account = get_asset_category_account(self.name, 'fixed_asset_account',
 					asset_category = self.asset_category, company = self.company)
+
+			cwip_account = get_asset_account("capital_work_in_progress_account",
+				self.name, self.asset_category, self.company)
 
 			gl_entries.append(self.get_gl_dict({
 				"account": cwip_account,
@@ -351,6 +377,9 @@ class Asset(AccountsController):
 				"debit": self.purchase_receipt_amount,
 				"debit_in_account_currency": self.purchase_receipt_amount
 			}))
+
+		if gl_entries:
+			from erpnext.accounts.general_ledger import make_gl_entries
 
 			make_gl_entries(gl_entries)
 			self.db_set('booked_fixed_asset', 1)
@@ -428,7 +457,7 @@ def create_asset_maintenance(asset, item_code, item_name, asset_category, compan
 
 @frappe.whitelist()
 def create_asset_adjustment(asset, asset_category, company):
-	asset_maintenance = frappe.new_doc("Asset Adjustment")
+	asset_maintenance = frappe.new_doc("Asset Value Adjustment")
 	asset_maintenance.update({
 		"asset": asset,
 		"company": company,
@@ -454,10 +483,7 @@ def transfer_asset(args):
 	frappe.msgprint(_("Asset Movement record {0} created").format("<a href='#Form/Asset Movement/{0}'>{0}</a>".format(movement_entry.name)))
 
 @frappe.whitelist()
-def get_item_details(item_code, asset_category=None):
-	if not asset_category:
-		frappe.throw(_("Please enter Asset Category in Item {0}").format(item_code))
-
+def get_item_details(item_code, asset_category):
 	asset_category_doc = frappe.get_doc('Asset Category', asset_category)
 	books = []
 	for d in asset_category_doc.finance_books:
@@ -471,15 +497,17 @@ def get_item_details(item_code, asset_category=None):
 
 	return books
 
-def get_cwip_account(asset, asset_category=None, company=None):
-	cwip_account = get_asset_category_account(asset, 'capital_work_in_progress_account',
-					asset_category = asset_category, company = company)
+def get_asset_account(account_name, asset=None, asset_category=None, company=None):
+	account = None
+	if asset:
+		account = get_asset_category_account(asset, account_name,
+				asset_category = asset_category, company = company)
 
-	if not cwip_account:
-		cwip_account = frappe.db.get_value('Company', company, 'capital_work_in_progress_account')
+	if not account:
+		account = frappe.db.get_value('Company', company, account_name)
 
-	if not cwip_account:
-		frappe.throw(_("Set Capital Work In Progress Account in asset category {0} or company {1}")
-			.format(asset_category, company))
+	if not account:
+		frappe.throw(_("Set {0} in asset category {1} or company {2}")
+			.format(account_name.replace('_', ' ').title(), asset_category, company))
 
-	return cwip_account
+	return account

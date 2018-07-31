@@ -21,18 +21,18 @@ from six import iteritems
 class DuplicatePartyAccountError(frappe.ValidationError): pass
 
 @frappe.whitelist()
-def get_party_details(party=None, account=None, party_type="Customer", company=None,
-	posting_date=None, bill_date=None, price_list=None, currency=None, doctype=None, ignore_permissions=False):
+def get_party_details(party=None, account=None, party_type="Customer", company=None, posting_date=None,
+	bill_date=None, price_list=None, currency=None, doctype=None, ignore_permissions=False, fetch_payment_terms_template=True):
 
 	if not party:
 		return {}
 	if not frappe.db.exists(party_type, party):
 		frappe.throw(_("{0}: {1} does not exists").format(party_type, party))
 	return _get_party_details(party, account, party_type,
-		company, posting_date, bill_date, price_list, currency, doctype, ignore_permissions)
+		company, posting_date, bill_date, price_list, currency, doctype, ignore_permissions, fetch_payment_terms_template)
 
-def _get_party_details(party=None, account=None, party_type="Customer", company=None,
-	posting_date=None, bill_date=None, price_list=None, currency=None, doctype=None, ignore_permissions=False):
+def _get_party_details(party=None, account=None, party_type="Customer", company=None, posting_date=None,
+	bill_date=None, price_list=None, currency=None, doctype=None, ignore_permissions=False, fetch_payment_terms_template=True):
 
 	out = frappe._dict(set_account_and_due_date(party, account, party_type, company, posting_date, bill_date, doctype))
 	party = out[party_type.lower()]
@@ -49,6 +49,11 @@ def _get_party_details(party=None, account=None, party_type="Customer", company=
 	set_contact_details(out, party, party_type)
 	set_other_values(out, party, party_type)
 	set_price_list(out, party, party_type, price_list)
+
+	out["taxes_and_charges"] = set_taxes(party.name, party_type, posting_date, company, out.customer_group, out.supplier_type)
+
+	if fetch_payment_terms_template:
+		out["payment_terms_template"] = get_pyt_term_template(party.name, party_type, company)
 
 	if not out.get("currency"):
 		out["currency"] = currency
@@ -282,6 +287,7 @@ def get_due_date(posting_date, party_type, party, company=None, bill_date=None):
 	if (bill_date or posting_date) and party:
 		due_date = bill_date or posting_date
 		template_name = get_pyt_term_template(party, party_type, company)
+
 		if template_name:
 			due_date = get_due_date_from_template(template_name, posting_date, bill_date).strftime("%Y-%m-%d")
 		else:
@@ -315,11 +321,14 @@ def get_due_date_from_template(template_name, posting_date, bill_date):
 			due_date = max(due_date, add_months(get_last_day(due_date), term.credit_months))
 	return due_date
 
-def validate_due_date(posting_date, due_date, party_type, party, company=None, bill_date=None):
+def validate_due_date(posting_date, due_date, party_type, party, company=None, bill_date=None, template_name=None):
 	if getdate(due_date) < getdate(posting_date):
 		frappe.throw(_("Due Date cannot be before Posting Date"))
 	else:
-		default_due_date = get_due_date(posting_date, party_type, party, company, bill_date)
+		if not template_name: return
+
+		default_due_date = get_due_date_from_template(template_name, posting_date, bill_date).strftime("%Y-%m-%d")
+
 		if not default_due_date:
 			return
 
@@ -422,10 +431,10 @@ def get_timeline_data(doctype, name):
 	# fetch and append data from Activity Log
 	data += frappe.db.sql("""select {fields}
 		from `tabActivity Log`
-		where reference_doctype='{doctype}' and reference_name='{name}'
+		where reference_doctype="{doctype}" and reference_name="{name}"
 		and status!='Success' and creation > {after}
 		{group_by} order by creation desc
-		""".format(doctype=doctype, name=name, fields=fields,
+		""".format(doctype=frappe.db.escape(doctype), name=frappe.db.escape(name), fields=fields,
 			group_by=group_by, after=after), as_dict=False)
 
 	timeline_items = dict(data)
@@ -529,11 +538,9 @@ def prepare_tax_withholding_details(tax_mapper, tax_withholding_details):
 def set_tax_withholding_details(tax_mapper, ref_doc, tax_withholding_category=None, use_default=0):
 	if tax_withholding_category:
 		tax_withholding = frappe.get_doc("Tax Withholding Category", tax_withholding_category)
-	else:
-		tax_withholding = frappe.get_doc("Tax Withholding Category", {'is_default': 1, 'enabled': 1})
 
 	if tax_withholding.book_on_invoice and ref_doc.doctype=='Purchase Invoice' \
-		or tax_withholding.book_on_advance and ref_doc.doctype in ('Payment Entry', 'Journal Entry'):
+		or ref_doc.doctype in ('Payment Entry', 'Journal Entry'):
 
 		for account_detail in tax_withholding.accounts:
 			if ref_doc.company == account_detail.company:

@@ -11,6 +11,9 @@ default_lead_sources = ["Existing Customer", "Reference", "Advertisement",
 	"Cold Calling", "Exhibition", "Supplier Reference", "Mass Mailing",
 	"Customer's Vendor", "Campaign", "Walk In"]
 
+default_sales_partner_type = ["Channel Partner", "Distributor", "Dealer", "Agent",
+	"Retailer", "Implementation Partner", "Reseller"]
+
 def install(country=None):
 	records = [
 		# domains
@@ -164,7 +167,6 @@ def install(country=None):
 		{'doctype': 'Activity Type', 'activity_type': _('Execution')},
 		{'doctype': 'Activity Type', 'activity_type': _('Communication')},
 
-		# Lead Source
 		{'doctype': "Item Attribute", "attribute_name": _("Size"), "item_attribute_values": [
 			{"attribute_value": _("Extra Small"), "abbr": "XS"},
 			{"attribute_value": _("Small"), "abbr": "S"},
@@ -180,6 +182,12 @@ def install(country=None):
 			{"attribute_value": _("Black"), "abbr": "BLA"},
 			{"attribute_value": _("White"), "abbr": "WHI"}
 		]},
+
+		#Job Applicant Source
+		{'doctype': 'Job Applicant Source', 'source_name': _('Website Listing')},
+		{'doctype': 'Job Applicant Source', 'source_name': _('Walk In')},
+		{'doctype': 'Job Applicant Source', 'source_name': _('Employee Referral')},
+		{'doctype': 'Job Applicant Source', 'source_name': _('Campaign')},
 
 		{'doctype': "Email Account", "email_id": "sales@example.com", "append_to": "Opportunity"},
 		{'doctype': "Email Account", "email_id": "support@example.com", "append_to": "Issue"},
@@ -224,14 +232,14 @@ def install(country=None):
 		# Share Management
 		{"doctype": "Share Type", "title": _("Equity")},
 		{"doctype": "Share Type", "title": _("Preference")},
-
-
 	]
 
 	from erpnext.setup.setup_wizard.data.industry_type import get_industry_types
 	records += [{"doctype":"Industry Type", "industry": d} for d in get_industry_types()]
 	# records += [{"doctype":"Operation", "operation": d} for d in get_operations()]
 	records += [{'doctype': 'Lead Source', 'source_name': _(d)} for d in default_lead_sources]
+
+	records += [{'doctype': 'Sales Partner Type', 'sales_partner_type': _(d)} for d in default_sales_partner_type]
 
 	base_path = frappe.get_app_path("erpnext", "hr", "doctype")
 	response = frappe.read_file(os.path.join(base_path, "leave_application/leave_application_email_template.html"))
@@ -259,23 +267,30 @@ def add_uom_data():
 	# add UOMs
 	uoms = json.loads(open(frappe.get_app_path("erpnext", "setup", "setup_wizard", "data", "uom_data.json")).read())
 	for d in uoms:
-		if not frappe.db.exists('UOM', d.get("uom_name")):
-			uom_doc = frappe.new_doc('UOM')
-			uom_doc.update(d)
-			uom_doc.save(ignore_permissions=True)
+		if not frappe.db.exists('UOM', _(d.get("uom_name"))):
+			uom_doc = frappe.get_doc({
+				"doctype": "UOM",
+				"uom_name": _(d.get("uom_name")),
+				"name": _(d.get("uom_name")),
+				"must_be_whole_number": d.get("must_be_whole_number")
+			}).insert(ignore_permissions=True)
 
 	# bootstrap uom conversion factors
 	uom_conversions = json.loads(open(frappe.get_app_path("erpnext", "setup", "setup_wizard", "data", "uom_conversion_data.json")).read())
 	for d in uom_conversions:
-		if not frappe.db.exists("UOM Category", d.get("category")):
+		if not frappe.db.exists("UOM Category", _(d.get("category"))):
 			frappe.get_doc({
 				"doctype": "UOM Category",
-				"category_name": d.get("category")
+				"category_name": _(d.get("category"))
 			}).insert(ignore_permissions=True)
 
-		uom_conversion = frappe.new_doc('UOM Conversion Factor')
-		uom_conversion.update(d)
-		uom_conversion.save(ignore_permissions=True)
+		uom_conversion = frappe.get_doc({
+			"doctype": "UOM Conversion Factor",
+			"category": _(d.get("category")),
+			"from_uom": _(d.get("from_uom")),
+			"to_uom": _(d.get("to_uom")),
+			"value": d.get("value")
+		}).insert(ignore_permissions=True)
 
 def make_fixture_records(records):
 	from frappe.modules import scrub

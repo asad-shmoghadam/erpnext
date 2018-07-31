@@ -15,6 +15,7 @@ from erpnext.buying.utils import validate_for_items, check_for_closed_status
 from erpnext.stock.utils import get_bin
 from six import string_types
 from erpnext.stock.doctype.item.item import get_item_defaults
+from erpnext.setup.doctype.item_group.item_group import get_item_group_defaults
 
 form_grid_templates = {
 	"items": "templates/form_grid/item_grid.html"
@@ -34,12 +35,6 @@ class PurchaseOrder(BuyingController):
 			'source_field': 'stock_qty',
 			'percent_join_field': 'material_request'
 		}]
-
-	def onload(self):
-		super(PurchaseOrder, self).onload()
-
-		self.set_onload('disable_fetch_last_purchase_rate',
-			cint(frappe.db.get_single_value("Buying Settings", "disable_fetch_last_purchase_rate")))
 
 	def validate(self):
 		super(PurchaseOrder, self).validate()
@@ -69,7 +64,7 @@ class PurchaseOrder(BuyingController):
 			},
 			"Supplier Quotation Item": {
 				"ref_dn_field": "supplier_quotation_item",
-				"compare_fields": [["project", "="], ["item_code", "="], 
+				"compare_fields": [["project", "="], ["item_code", "="],
 					["uom", "="], ["conversion_factor", "="]],
 				"is_child_table": True
 			}
@@ -124,7 +119,6 @@ class PurchaseOrder(BuyingController):
 
 	def get_last_purchase_rate(self):
 		"""get last purchase rates for all items"""
-		if cint(frappe.db.get_single_value("Buying Settings", "disable_fetch_last_purchase_rate")): return
 
 		conversion_rate = flt(self.get('conversion_rate')) or 1.0
 		for d in self.get("items"):
@@ -219,6 +213,9 @@ class PurchaseOrder(BuyingController):
 		frappe.get_doc('Authorization Control').validate_approving_authority(self.doctype,
 			self.company, self.base_grand_total)
 
+		self.update_blanket_order()
+
+
 	def on_cancel(self):
 		super(PurchaseOrder, self).on_cancel()
 
@@ -240,6 +237,9 @@ class PurchaseOrder(BuyingController):
 		# Must be called after updating ordered qty in Material Request
 		self.update_requested_qty()
 		self.update_ordered_qty()
+
+		self.update_blanket_order()
+
 
 	def on_update(self):
 		pass
@@ -286,10 +286,16 @@ class PurchaseOrder(BuyingController):
 			if d.rm_item_code:
 				stock_bin = get_bin(d.rm_item_code, d.reserve_warehouse)
 				stock_bin.update_reserved_qty_for_sub_contracting()
+	
+	def update_receiving_percentage(self):
+		total_qty, received_qty = 0.0, 0.0
+		for item in self.items:
+			received_qty += item.received_qty
+			total_qty += item.qty
+		self.db_set("per_received", flt(received_qty/total_qty) * 100, update_modified=False)
 
 def item_last_purchase_rate(name, conversion_rate, item_code, conversion_factor= 1.0):
 	"""get last purchase rate for an item"""
-	if cint(frappe.db.get_single_value("Buying Settings", "disable_fetch_last_purchase_rate")): return
 
 	conversion_rate = flt(conversion_rate) or 1.0
 
@@ -317,6 +323,7 @@ def close_or_unclose_purchase_orders(names, status):
 			else:
 				if po.status == "Closed":
 					po.update_status("Draft")
+			po.update_blanket_order()
 
 	frappe.local.message_log = []
 
@@ -376,9 +383,10 @@ def make_purchase_invoice(source_name, target_doc=None):
 		target.qty = target.amount / flt(obj.rate) if (flt(obj.rate) and flt(obj.billed_amt)) else flt(obj.qty)
 
 		item = get_item_defaults(target.item_code, source_parent.company)
+		item_group = get_item_group_defaults(target.item_code, source_parent.company)
 		target.cost_center = frappe.db.get_value("Project", obj.project, "cost_center") \
 			or item.get("buying_cost_center") \
-			or frappe.db.get_value("Item Group", item.item_group, "default_cost_center")
+			or item_group.get("buying_cost_center")
 
 	doc = get_mapped_doc("Purchase Order", source_name,	{
 		"Purchase Order": {

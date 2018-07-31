@@ -152,8 +152,6 @@ erpnext.TransactionController = erpnext.taxes_and_totals.extend({
 	onload: function() {
 		var me = this;
 
-		this.setup_quality_inspection();
-
 		if(this.frm.doc.__islocal) {
 			var currency = frappe.defaults.get_user_default("currency");
 
@@ -230,6 +228,7 @@ erpnext.TransactionController = erpnext.taxes_and_totals.extend({
 		erpnext.hide_company();
 		this.set_dynamic_labels();
 		this.setup_sms();
+		this.setup_quality_inspection();
 	},
 
 	apply_default_taxes: function() {
@@ -1320,6 +1319,36 @@ erpnext.TransactionController = erpnext.taxes_and_totals.extend({
 						for (var d in r.message) {
 							frappe.model.set_value(cdt, cdn, d, r.message[d]);
 						}
+					}
+				}
+			})
+		}
+	},
+
+	blanket_order: function(doc, cdt, cdn) {
+		var me = this;
+		var item = locals[cdt][cdn];
+		if (item.blanket_order && (item.parenttype=="Sales Order" || item.parenttype=="Purchase Order")) {
+			frappe.call({
+				method: "erpnext.stock.get_item_details.get_blanket_order_details",
+				args: {
+					args:{
+						item_code: item.item_code,
+						customer: doc.customer,
+						supplier: doc.supplier,
+						company: doc.company,
+						transaction_date: doc.transaction_date,
+						blanket_order: item.blanket_order
+					}
+				},
+				callback: function(r) {
+					if (!r.message) {
+						frappe.throw(__("Invalid Blanket Order for the selected Customer and Item"));
+					} else {
+						frappe.run_serially([
+							() => frappe.model.set_value(cdt, cdn, "blanket_order_rate", r.message.blanket_order_rate),
+							() => me.frm.script_manager.trigger("price_list_rate", cdt, cdn)
+						]);
 					}
 				}
 			})

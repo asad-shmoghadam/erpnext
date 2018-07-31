@@ -79,6 +79,12 @@ class BuyingController(StockController):
 					{"parent": d.item_code, "company": self.company}, "default_supplier")
 				if supplier:
 					self.supplier = supplier
+				else:
+					item_group = frappe.db.get_value("Item", d.item_code, "item_group")
+					supplier = frappe.db.get_value("Item Default",
+					{"parent": item_group, "company": self.company}, "default_supplier")
+					if supplier:
+						self.supplier = supplier
 					break
 
 	def validate_stock_or_nonstock_items(self):
@@ -515,13 +521,15 @@ class BuyingController(StockController):
 	def validate_budget(self):
 		if self.docstatus == 1:
 			for data in self.get('items'):
-				validate_expense_against_budget({
-					'item_code': data.item_code,
-					'item_group': data.item_group,
-					'posting_date': data.schedule_date,
-					'project': data.project,
-					'doctype': self.doctype
-				}, self.company)
+				args = data.as_dict()
+				args.update({
+					'doctype': self.doctype,
+					'company': self.company,
+					'posting_date': (self.schedule_date
+						if self.doctype == 'Material Request' else self.transaction_date)
+				})
+
+				validate_expense_against_budget(args)
 
 	def process_fixed_asset(self):
 		if self.doctype == 'Purchase Invoice' and not self.update_stock:
@@ -558,7 +566,8 @@ class BuyingController(StockController):
 						'actual_qty': d.qty,
 						'purchase_document_type': self.doctype,
 						'purchase_document_no': self.name,
-						'asset': d.asset
+						'asset': d.asset,
+						'location': d.asset_location
 					})
 					d.db_set('serial_no', serial_nos)
 
@@ -577,7 +586,6 @@ class BuyingController(StockController):
 			'doctype': 'Asset',
 			'item_code': row.item_code,
 			'asset_name': row.item_name,
-			'status': 'Receipt',
 			'naming_series': item_data.get('asset_naming_series') or 'AST',
 			'asset_category': item_data.get('asset_category'),
 			'location': row.asset_location,
@@ -663,6 +671,7 @@ class BuyingController(StockController):
 
 	def validate_items(self):
 		# validate items to see if they have is_purchase_item or is_subcontracted_item enabled
+		if self.doctype=="Material Request": return
 
 		if hasattr(self, "is_subcontracted") and self.is_subcontracted == 'Yes':
 			validate_item_type(self, "is_sub_contracted_item", "subcontracted")
@@ -696,7 +705,7 @@ def get_subcontracted_raw_materials_from_se(purchase_orders):
 		from `tabStock Entry` se,`tabStock Entry Detail` sed
 		where
 			se.name = sed.parent and se.docstatus=1 and se.purpose='Subcontract'
-			and se.purchase_order= (%s) and ifnull(sed.t_warehouse, '') != ''
+			and se.purchase_order in (%s) and ifnull(sed.t_warehouse, '') != ''
 		group by sed.item_code, sed.t_warehouse
 	""" % (','.join(['%s'] * len(purchase_orders))), tuple(purchase_orders), as_dict=1)
 
@@ -706,8 +715,8 @@ def get_backflushed_subcontracted_raw_materials_from_se(purchase_orders, purchas
 			prsi.rm_item_code as item_code, sum(prsi.consumed_qty) as qty
 		from `tabPurchase Receipt` pr, `tabPurchase Receipt Item` pri, `tabPurchase Receipt Item Supplied` prsi
 		where
-			pr.name = pri.parent and pr.name = prsi.parent and pri.purchase_order= (%s)
-			and pri.item_code = prsi.main_item_code and pr.name != '%s'
+			pr.name = pri.parent and pr.name = prsi.parent and pri.purchase_order in (%s)
+			and pri.item_code = prsi.main_item_code and pr.name != '%s' and pr.docstatus = 1
 		group by prsi.rm_item_code
 	""" % (','.join(['%s'] * len(purchase_orders)), purchase_receipt), tuple(purchase_orders)))
 
@@ -734,8 +743,8 @@ def validate_item_type(doc, fieldname, message):
 		""".format(item_list, fieldname), as_list=True)]
 
 	if invalid_items:
-		frappe.throw(_("Following item {items} {verb} not marked as {message} item.\
+		frappe.throw(_("Following item {items} {verb} marked as {message} item.\
 			You can enable them as {message} item from its Item master".format(
 				items = ", ".join([d for d in invalid_items]),
-				verb = "are" if len(invalid_items) > 1 else "is",
+				verb = _("are not") if len(invalid_items) > 1 else _("is not"),
 				message = message)))

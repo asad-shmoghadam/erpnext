@@ -76,12 +76,16 @@ class Budget(Document):
 			or self.applicable_on_purchase_order or self.applicable_on_booking_actual_expenses):
 			self.applicable_on_booking_actual_expenses = 1
 
-def validate_expense_against_budget(args, company=None):
+def validate_expense_against_budget(args):
 	args = frappe._dict(args)
 
-	if company:
-		args.company = company
-		args.fiscal_year = get_fiscal_year(nowdate(), company=company)[0]
+	if args.get('company') and not args.fiscal_year:
+		args.fiscal_year = get_fiscal_year(args.get('posting_date'), company=args.get('company'))[0]
+		frappe.flags.exception_approver_role = frappe.db.get_value('Company',
+			args.get('company'), 'exception_budget_approver_role')
+
+	if not args.account:
+		args.account = args.get("expense_account")
 
 	if not (args.get('account') and args.get('cost_center')) and args.item_code:
 		args.cost_center, args.account = get_item_details(args)
@@ -123,7 +127,7 @@ def validate_expense_against_budget(args, company=None):
 			""".format(condition=condition, 
 				budget_against_field=frappe.scrub(args.get("budget_against_field"))),
 				(args.fiscal_year, args.account), as_dict=True)
-				
+
 			if budget_records:
 				validate_budget_records(args, budget_records)
 
@@ -136,6 +140,7 @@ def validate_budget_records(args, budget_records):
 			if monthly_action in ["Stop", "Warn"]:
 				budget_amount = get_accumulated_monthly_budget(budget.monthly_distribution,
 					args.posting_date, args.fiscal_year, budget.budget_amount)
+
 				args["month_end_date"] = get_last_day(args.posting_date)
 
 				compare_expense_with_budget(args, budget_amount, 
@@ -157,6 +162,10 @@ def compare_expense_with_budget(args, budget_amount, action_for, action, budget_
 				frappe.bold(budget_against),
 				frappe.bold(fmt_money(budget_amount, currency=currency)), 
 				frappe.bold(fmt_money(diff, currency=currency)))
+
+		if (frappe.flags.exception_approver_role
+			and frappe.flags.exception_approver_role in frappe.get_roles(frappe.session.user)):
+			action = "Warn"
 
 		if action=="Stop":
 			frappe.throw(msg, BudgetError)
@@ -181,38 +190,51 @@ def get_amount(args, budget):
 	amount = 0
 
 	if args.get('doctype') == 'Material Request' and budget.for_material_request:
-		amount = (get_requested_amount(args)
-			+ get_ordered_amount(args) + get_actual_expense(args))
+		amount = (get_requested_amount(args, budget)
+			+ get_ordered_amount(args, budget) + get_actual_expense(args))
 
 	elif args.get('doctype') == 'Purchase Order' and budget.for_purchase_order:
-		amount = get_ordered_amount(args) + get_actual_expense(args)
+		amount = get_ordered_amount(args, budget) + get_actual_expense(args)
 
 	return amount
 
-def get_requested_amount(args):
+def get_requested_amount(args, budget):
 	item_code = args.get('item_code')
-	condition = get_project_condiion(args)
+	condition = get_other_condition(args, budget, 'Material Request')
 
-	data = frappe.db.sql(""" select ifnull((sum(stock_qty - ordered_qty) * rate), 0) as amount
-		from `tabMaterial Request Item` where item_code = %s and docstatus = 1
-		and stock_qty > ordered_qty and {0}""".format(condition), item_code, as_list=1)
+	data = frappe.db.sql(""" select ifnull((sum(mri.stock_qty - mri.ordered_qty) * rate), 0) as amount
+		from `tabMaterial Request Item` mri, `tabMaterial Request` mr where mr.name = mri.parent and
+		mri.item_code = %s and mr.docstatus = 1 and mri.stock_qty > mri.ordered_qty and {0} and
+		mr.material_request_type = 'Purchase' and mr.status != 'Stopped'""".format(condition), item_code, as_list=1)
 
 	return data[0][0] if data else 0
 
-def get_ordered_amount(args):
+def get_ordered_amount(args, budget):
 	item_code = args.get('item_code')
-	condition = get_project_condiion(args)
+	condition = get_other_condition(args, budget, 'Purchase Order')
 
-	data = frappe.db.sql(""" select ifnull(sum(amount - billed_amt), 0) as amount
-		from `tabPurchase Order Item` where item_code = %s and docstatus = 1
-		and amount > billed_amt and {0}""".format(condition), item_code, as_list=1)
+	data = frappe.db.sql(""" select ifnull(sum(poi.amount - poi.billed_amt), 0) as amount
+		from `tabPurchase Order Item` poi, `tabPurchase Order` po where
+		po.name = poi.parent and poi.item_code = %s and po.docstatus = 1 and poi.amount > poi.billed_amt
+		and po.status != 'Closed' and {0}""".format(condition), item_code, as_list=1)
 
 	return data[0][0] if data else 0
 
-def get_project_condiion(args):
-	condition = "1=1"
-	if args.get('project'):
-		condition = "project = '%s'" %(args.get('project'))
+def get_other_condition(args, budget, for_doc):
+	condition = "expense_account = '%s'" % (args.expense_account)
+	budget_against_field = frappe.scrub(args.get("budget_against_field"))
+
+	if budget_against_field and args.get(budget_against_field):
+		condition += " and %s = '%s'" %(budget_against_field, args.get(budget_against_field))
+
+	if args.get('fiscal_year'):
+		date_field = 'schedule_date' if for_doc == 'Material Request' else 'transaction_date'
+		start_date, end_date = frappe.db.get_value('Fiscal Year', args.get('fiscal_year'),
+			['year_start_date', 'year_end_date'])
+
+		alias = 'mr' if for_doc == 'Material Request' else 'po'
+		condition += """ and %s.%s
+			between '%s' and '%s' """ %(alias, date_field, start_date, end_date)
 
 	return condition
 
@@ -276,8 +298,7 @@ def get_item_details(args):
 
 	if not (cost_center and expense_account):
 		for doctype in ['Item Group', 'Company']:
-			data = get_expense_cost_center(doctype,
-				args.get(frappe.scrub(doctype)))
+			data = get_expense_cost_center(doctype, args)
 
 			if not cost_center and data:
 				cost_center = data[0]
@@ -290,8 +311,11 @@ def get_item_details(args):
 
 	return cost_center, expense_account
 
-def get_expense_cost_center(doctype, value):
-	fields = (['default_cost_center', 'default_expense_account']
-		if doctype == 'Item Group' else ['cost_center', 'default_expense_account'])
-
-	return frappe.db.get_value(doctype, value, fields)
+def get_expense_cost_center(doctype, args):
+	if doctype == 'Item Group':
+		return frappe.db.get_value('Item Default',
+			{'parent': args.get(frappe.scrub(doctype)), 'company': args.get('company')},
+			['buying_cost_center', 'expense_account'])
+	else:
+		return frappe.db.get_value(doctype, args.get(frappe.scrub(doctype)),\
+			['cost_center', 'default_expense_account'])

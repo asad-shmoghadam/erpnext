@@ -81,7 +81,7 @@ def add_print_formats():
 	frappe.db.sql(""" update `tabPrint Format` set disabled = 0 where
 		name in('GST POS Invoice', 'GST Tax Invoice') """)
 
-def make_custom_fields():
+def make_custom_fields(update=True):
 	hsn_sac_field = dict(fieldname='gst_hsn_code', label='HSN/SAC',
 		fieldtype='Data', options='item_code.gst_hsn_code', insert_after='description',
 		allow_on_submit=1, print_hide=1)
@@ -191,10 +191,57 @@ def make_custom_fields():
 		'Employee': [
 			dict(fieldname='ifsc_code', label='IFSC Code',
 				fieldtype='Data', insert_after='bank_ac_no', print_hide=1,
-				depends_on='eval:doc.salary_mode == "Bank"') ]
+				depends_on='eval:doc.salary_mode == "Bank"')
+		],
+		'Company': [
+			dict(fieldname='hra_section', label='HRA Settings',
+				fieldtype='Section Break', insert_after='asset_received_but_not_billed'),
+			dict(fieldname='basic_component', label='Basic Component',
+				fieldtype='Link', options='Salary Component', insert_after='hra_section'),
+			dict(fieldname='hra_component', label='HRA Component',
+				fieldtype='Link', options='Salary Component', insert_after='basic_component'),
+			dict(fieldname='arrear_component', label='Arrear Component',
+				fieldtype='Link', options='Salary Component', insert_after='hra_component')
+		],
+		'Employee Tax Exemption Declaration':[
+			dict(fieldname='hra_section', label='HRA Exemption',
+				fieldtype='Section Break', insert_after='declarations'),
+			dict(fieldname='salary_structure_hra', label='HRA as per Salary Structure',
+				fieldtype='Currency', insert_after='hra_section', read_only=1),
+			dict(fieldname='monthly_house_rent', label='Monthly House Rent',
+				fieldtype='Currency', insert_after='salary_structure_hra'),
+			dict(fieldname='rented_in_metro_city', label='Rented in Metro City',
+				fieldtype='Check', insert_after='monthly_house_rent'),
+			dict(fieldname='hra_column_break', fieldtype='Column Break',
+				insert_after='rented_in_metro_city'),
+			dict(fieldname='annual_hra_exemption', label='Annual HRA Exemption',
+				fieldtype='Currency', insert_after='hra_column_break', read_only=1),
+			dict(fieldname='monthly_hra_exemption', label='Monthly HRA Exemption',
+				fieldtype='Currency', insert_after='annual_hra_exemption', read_only=1)
+		],
+		'Employee Tax Exemption Proof Submission': [
+			dict(fieldname='hra_section', label='HRA Exemption',
+				fieldtype='Section Break', insert_after='tax_exemption_proofs'),
+			dict(fieldname='house_rent_payment_amount', label='House Rent Payment Amount',
+				fieldtype='Currency', insert_after='hra_section'),
+			dict(fieldname='rented_in_metro_city', label='Rented in Metro City',
+				fieldtype='Check', insert_after='house_rent_payment_amount'),
+			dict(fieldname='rented_from_date', label='Rented From Date',
+				fieldtype='Date', insert_after='rented_in_metro_city'),
+			dict(fieldname='rented_to_date', label='Rented To Date',
+				fieldtype='Date', insert_after='rented_from_date'),
+			dict(fieldname='hra_column_break', fieldtype='Column Break',
+				insert_after='rented_to_date'),
+			dict(fieldname='monthly_house_rent', label='Monthly House Rent',
+				fieldtype='Currency', insert_after='hra_column_break', read_only=1),
+			dict(fieldname='monthly_hra_exemption', label='Monthly Eligible Amount',
+				fieldtype='Currency', insert_after='monthly_house_rent', read_only=1),
+			dict(fieldname='total_eligible_hra_exemption', label='Total Eligible HRA Exemption',
+				fieldtype='Currency', insert_after='monthly_hra_exemption', read_only=1)
+		]
 	}
 
-	create_custom_fields(custom_fields, ignore_validate = frappe.flags.in_patch)
+	create_custom_fields(custom_fields, ignore_validate = frappe.flags.in_patch, update=update)
 
 def make_fixtures(company=None):
 	docs = []
@@ -202,7 +249,6 @@ def make_fixtures(company=None):
 
 	set_salary_components(docs)
 	set_tds_account(docs, company)
-	set_tax_withholding_category(docs, company)
 
 	for d in docs:
 		try:
@@ -211,6 +257,9 @@ def make_fixtures(company=None):
 			doc.insert()
 		except frappe.NameError:
 			pass
+
+	# create tds fixtures
+	set_tax_withholding_category(company)
 
 def set_salary_components(docs):
 	docs.extend([
@@ -222,32 +271,33 @@ def set_salary_components(docs):
 		{'doctype': 'Salary Component', 'salary_component': 'Leave Encashment', 'description': 'Leave Encashment', 'type': 'Earning'}
 	])
 
-def set_tax_withholding_category(docs, company):
+def set_tax_withholding_category(company):
 	accounts = []
-	tds_account = frappe.db.get_value("Account", filter={"account_type": "Payable",
-		"account_name": "TDS", "company": company})
+	abbr = frappe.get_value("Company", company, "abbr")
+	tds_account = frappe.get_value("Account", 'TDS Payable - {0}'.format(abbr), 'name')
 
 	if company and tds_account:
-		accounts = [
-				{
-					'company': company,
-					'account': tds_account
-				}
-			]
+		accounts = [dict(company=company, account=tds_account)]
 
-	docs.extend([
-		{
-			'doctype': 'Tax Withholding Category', '__newname': 'TDS',
-			'percent_of_tax_withheld': 10,'threshold': 150000, 'book_on_invoice': 1,
-			'book_on_advance': 0, "withhold_cumulative_tax_amount": 0,
-			'accounts': accounts
-		}
-	])
+	tds = frappe.get_doc({
+		'doctype': 'Tax Withholding Category', 'name': 'TDS',
+		'percent_of_tax_withheld': 10,'threshold': 150000, 'book_on_invoice': 1,
+		'withhold_cumulative_tax_amount': 0, 'accounts': accounts
+	})
+
+	try:
+		tds.flags.ignore_permissions = True
+		tds.insert()
+	except frappe.DuplicateEntryError:
+		tds = frappe.get_doc("Tax Withholding Category", tds.get("name"))
+		tds.append("accounts", accounts[0])
+		tds.save()
 
 def set_tds_account(docs, company):
+	abbr = frappe.get_value("Company", company, "abbr")
 	docs.extend([
 		{
-			'doctype': 'Account', 'account_name': 'TDS', 'account_type': 'Tax',
-			'parent_account': 'Duties and Taxes', 'company': company
+			"doctype": "Account", "account_name": "TDS Payable", "account_type": "Tax",
+			"parent_account": "Duties and Taxes - {0}".format(abbr), "company": company
 		}
 	])
